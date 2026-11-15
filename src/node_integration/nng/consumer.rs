@@ -1,6 +1,7 @@
+use super::pub_listener::{NodeEvent, PubListener};
 use crate::{node_int_debug, node_int_error, node_int_info, node_int_warn};
 use anyhow::Result;
-use bitcoinsuite_bitcoind_nng::{BlockDisconnected, Message, MiningWorkChanged, PubInterface};
+use bitcoinsuite_bitcoind_nng::{BlockDisconnected, MiningWorkChanged};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -14,11 +15,16 @@ use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusHeader};
 /// Debounce duration for miningwrkchg events: 100ms.
 const MINING_WORK_COALESCE_MS: u64 = 100;
 
+/// Capacity of the channel between the pub listener thread and the consumer.
+const EVENT_CHANNEL_CAPACITY: usize = 4096;
+
 /// Consumes NNG pub/sub events and orchestrates the downstream effects.
 ///
 /// Standalone task spawned in main.rs (not owned by StratumServer).
 pub struct NngEventConsumer {
-    interface: PubInterface,
+    /// Receives pub/sub events on its own thread (see `pub_listener`).
+    listener: PubListener,
+    events_rx: mpsc::Receiver<NodeEvent>,
     nng_rpc: Arc<NngRpcClient>,
     job_cache: Arc<JobCache>,
     accounting: Option<AccountingService>,
@@ -40,20 +46,13 @@ impl NngEventConsumer {
         maturation_tx: mpsc::UnboundedSender<PayoutEvent>,
         min_confirmations: u64,
     ) -> Result<Self> {
-        let interface = PubInterface::open(pub_url)
+        let (events_tx, events_rx) = mpsc::channel::<NodeEvent>(EVENT_CHANNEL_CAPACITY);
+        let listener = PubListener::spawn(pub_url, events_tx)
             .map_err(|e| anyhow::anyhow!("failed to open NNG pub interface: {}", e))?;
-        interface
-            .subscribe("miningwrkchg")
-            .map_err(|e| anyhow::anyhow!("failed to subscribe to miningwrkchg: {}", e))?;
-        interface
-            .subscribe("blkconnected")
-            .map_err(|e| anyhow::anyhow!("failed to subscribe to blkconnected: {}", e))?;
-        interface
-            .subscribe("blkdisconctd")
-            .map_err(|e| anyhow::anyhow!("failed to subscribe to blkdisconctd: {}", e))?;
         node_int_info!(pub_url, "NNG pub/sub consumer subscribed to events");
         Ok(Self {
-            interface,
+            listener,
+            events_rx,
             nng_rpc,
             job_cache,
             accounting,
@@ -65,7 +64,7 @@ impl NngEventConsumer {
     }
 
     /// Run the event loop until shutdown signal is received.
-    pub async fn run(self, mut shutdown_signal: broadcast::Receiver<()>) -> Result<()> {
+    pub async fn run(mut self, mut shutdown_signal: broadcast::Receiver<()>) -> Result<()> {
         node_int_info!("NNG pub/sub consumer starting event loop");
 
         let (raw_tx, raw_rx) = mpsc::channel::<MiningWorkChanged>(32);
@@ -78,9 +77,11 @@ impl NngEventConsumer {
 
         loop {
             tokio::select! {
-                msg = self.interface.recv_async() => {
-                    match msg {
-                        Ok(Message::MiningWorkChanged(event)) => {
+                // mpsc::Receiver::recv is cancel-safe: losing this race to
+                // another branch never drops an event.
+                event = self.events_rx.recv() => {
+                    match event {
+                        Some(NodeEvent::MiningWorkChanged(event)) => {
                             node_int_debug!(
                                 reason = ?event.reason,
                                 height = event.height,
@@ -91,7 +92,7 @@ impl NngEventConsumer {
                                 node_int_warn!("coalescer input channel closed");
                             }
                         }
-                        Ok(Message::BlockDisconnected(event)) => {
+                        Some(NodeEvent::BlockDisconnected(event)) => {
                             let block_hash = event.block.header.hash.to_hex_be();
                             node_int_debug!(block_hash, "received blkdisconctd event");
                             node_int_debug!(
@@ -104,7 +105,7 @@ impl NngEventConsumer {
                                 handle_block_disconnected(event, acct).await;
                             }
                         }
-                        Ok(Message::BlockConnected(event)) => {
+                        Some(NodeEvent::BlockConnected(event)) => {
                             let block_hash = event.block.header.hash.to_hex_be();
                             node_int_debug!(
                                 block_hash = %block_hash,
@@ -123,9 +124,9 @@ impl NngEventConsumer {
                                 ).await;
                             }
                         }
-                        Ok(_) => {}
-                        Err(e) => {
-                            node_int_error!(error = %e, "NNG pub/sub recv error");
+                        None => {
+                            node_int_error!("NNG pub/sub listener thread stopped");
+                            break;
                         }
                     }
                 }
@@ -139,6 +140,8 @@ impl NngEventConsumer {
             }
         }
 
+        self.events_rx.close();
+        self.listener.stop();
         Ok(())
     }
 
@@ -222,7 +225,7 @@ pub fn miningwrkchg_reason_to_string(
     }
 }
 
-// ---- Standalone handler functions (testable without PubInterface) ----
+// ---- Standalone handler functions (testable without a pub socket) ----
 
 /// Handle a block disconnected event: if the disconnected block matches a
 /// found_block, mark it orphaned and close the associated round.
