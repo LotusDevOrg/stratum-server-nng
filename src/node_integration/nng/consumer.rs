@@ -75,6 +75,8 @@ impl NngEventConsumer {
             coalesce_events(raw_rx, coalesced_tx, coalescer_shutdown).await;
         });
 
+        let mut connections = ConnectionTracker::default();
+        let mut last_epoch: u64 = 0;
         loop {
             tokio::select! {
                 // mpsc::Receiver::recv is cancel-safe: losing this race to
@@ -88,6 +90,7 @@ impl NngEventConsumer {
                                 epoch = event.template_epoch,
                                 "received miningwrkchg event",
                             );
+                            last_epoch = event.template_epoch;
                             if raw_tx.send(event).await.is_err() {
                                 node_int_warn!("coalescer input channel closed");
                             }
@@ -123,6 +126,22 @@ impl NngEventConsumer {
                                     self.min_confirmations,
                                 ).await;
                             }
+                        }
+                        Some(NodeEvent::Connected) => {
+                            // A reconnection means lotusd restarted (or the
+                            // link came back): the jobs miners hold may refer
+                            // to templates the node no longer knows, and the
+                            // miningwrkchg events of the gap are lost. Refresh
+                            // now instead of waiting for the next work change.
+                            if connections.on_connected() {
+                                node_int_info!("NNG pub socket reconnected to lotusd: refreshing the job");
+                                if raw_tx.send(reconnect_refresh_event(last_epoch)).await.is_err() {
+                                    node_int_warn!("coalescer input channel closed");
+                                }
+                            }
+                        }
+                        Some(NodeEvent::Disconnected) => {
+                            node_int_warn!("NNG pub socket lost its connection to lotusd");
                         }
                         None => {
                             node_int_error!("NNG pub/sub listener thread stopped");
@@ -207,6 +226,33 @@ impl NngEventConsumer {
         if self.job_tx.send(job).is_err() {
             node_int_warn!("no active session consumers for new job broadcast");
         }
+    }
+}
+
+/// Tells a reconnection to lotusd apart from the first connection (the job
+/// fetched at startup is current then).
+#[derive(Debug, Default)]
+struct ConnectionTracker {
+    connected_once: bool,
+}
+
+impl ConnectionTracker {
+    /// Record a connection; returns true when it is a reconnection, i.e.
+    /// when the job must be refreshed.
+    fn on_connected(&mut self) -> bool {
+        std::mem::replace(&mut self.connected_once, true)
+    }
+}
+
+/// The work change the consumer injects itself after a reconnection to
+/// lotusd (forwarded to miners as reason "manual").
+fn reconnect_refresh_event(last_epoch: u64) -> MiningWorkChanged {
+    MiningWorkChanged {
+        reason: bitcoinsuite_bitcoind_nng::MiningWorkChangedReason::ManualInvalidation,
+        block_hash: Default::default(),
+        height: 0,
+        node_time: 0,
+        template_epoch: last_epoch,
     }
 }
 
@@ -1029,5 +1075,23 @@ mod tests {
             Some("reorg_detected".to_string()),
             "orphan_reason should be preserved"
         );
+    }
+
+    #[test]
+    fn test_connection_tracker_refreshes_only_on_reconnection() {
+        let mut tracker = ConnectionTracker::default();
+        assert!(
+            !tracker.on_connected(),
+            "first connection: startup job is current"
+        );
+        assert!(tracker.on_connected(), "reconnection: refresh");
+        assert!(tracker.on_connected(), "every later reconnection: refresh");
+    }
+
+    #[test]
+    fn test_reconnect_refresh_event_is_a_manual_invalidation() {
+        let event = reconnect_refresh_event(41);
+        assert_eq!(event.template_epoch, 41);
+        assert_eq!(miningwrkchg_reason_to_string(event.reason), "manual");
     }
 }

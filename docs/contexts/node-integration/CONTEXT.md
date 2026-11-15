@@ -53,6 +53,7 @@ src/node_integration/
   - `miningwrkchg` → template fetch, job conversion, broadcast via `broadcast::Sender` to all sessions. Injects the reason code into `MiningJob.reason` for miner-facing explanations. **No chain state or payout logic.**
   - `blkconnected` → decodes block height from Lotus header bytes via `LotusHeader::deser()`, updates `ChainTip`. Before maturation, checks if the arriving block hash belongs to an orphaned pool block and un-orphans it if safe (no submitted payout). Then calls `check_maturation()` and sends matured block hashes + transaction IDs through the payout maturation channel. **Sole driver of runtime chain-state tracking, reorg recovery, and payout triggers.**
   - `blkdisconctd` → records orphaned found_blocks via AccountingService on matched block hash.
+  - Reconnection of the pub socket to lotusd (nng pipe notification, not the first connection) → a synthetic work change (reason `manual`) refreshes the job, since events published during the gap are lost.
 
 ### Reorg Detection
 

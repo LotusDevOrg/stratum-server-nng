@@ -13,13 +13,18 @@
 //! timeout (so it notices `stop()`), parses messages with bitcoinsuite's
 //! flatbuffer types and forwards them over a bounded tokio channel, whose
 //! `recv()` is cancel-safe.
+//!
+//! The listener also reports every (re)connection of the SUB socket to
+//! lotusd as [`NodeEvent::Connected`], from an nng pipe notification: after
+//! lotusd restarts, nng redials on its own but no `miningwrkchg` may arrive
+//! for a while, so the consumer must refresh the job itself.
 
 use anyhow::Result;
 use bitcoinsuite_bitcoind_nng::nng_interface_generated::nng_interface as fbs;
 use bitcoinsuite_bitcoind_nng::{BlockConnected, BlockDisconnected, MiningWorkChanged};
 use nng::options::protocol::pubsub::Subscribe;
 use nng::options::{Options, RecvBufferSize, RecvTimeout};
-use nng::{Protocol, Socket};
+use nng::{PipeEvent, Protocol, Socket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +45,11 @@ pub enum NodeEvent {
     MiningWorkChanged(MiningWorkChanged),
     BlockConnected(BlockConnected),
     BlockDisconnected(BlockDisconnected),
+    /// A connection (pipe) to lotusd was established, the first one or a
+    /// reconnection.
+    Connected,
+    /// The connection (pipe) to lotusd was lost; nng redials on its own.
+    Disconnected,
 }
 
 /// Parse one pub message (12-byte topic prefix + flatbuffer payload).
@@ -83,8 +93,8 @@ pub struct PubListener {
 }
 
 impl PubListener {
-    /// Dial `url`, subscribe to [`TOPICS`] and forward every parsed event to
-    /// `tx` from a dedicated thread.
+    /// Dial `url`, subscribe to [`TOPICS`] and forward every parsed event,
+    /// and every connection change, to `tx` from a dedicated thread.
     pub fn spawn(url: &str, tx: mpsc::Sender<NodeEvent>) -> Result<Self> {
         let sock = Socket::new(Protocol::Sub0)?;
         // Same buffer as PubInterface: absorbs bursts during reorgs.
@@ -93,6 +103,16 @@ impl PubListener {
         for topic in TOPICS {
             sock.set_opt::<Subscribe>(topic.as_bytes().to_vec())?;
         }
+        let pipe_tx = tx.clone();
+        sock.pipe_notify(move |_pipe, event| {
+            let event = match event {
+                PipeEvent::AddPost => NodeEvent::Connected,
+                PipeEvent::RemovePost => NodeEvent::Disconnected,
+                _ => return,
+            };
+            // Runs on an nng thread: must neither block nor panic.
+            let _ = pipe_tx.try_send(event);
+        })?;
         sock.dial(url)?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -197,6 +217,57 @@ mod tests {
             }
         }
         panic!("subscriber never received a probe");
+    }
+
+    async fn wait_for_connected(rx: &mut mpsc::Receiver<NodeEvent>) {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("no Connected event")
+            {
+                Some(NodeEvent::Connected) => return,
+                Some(_) => {}
+                None => panic!("listener channel closed"),
+            }
+        }
+    }
+
+    /// A publisher restart (lotusd restart) is reported as Disconnected then
+    /// Connected, and events flow again afterwards.
+    #[tokio::test]
+    async fn test_reports_reconnection_after_publisher_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = ipc_url(&dir);
+        let pubs = publisher(&url);
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut listener = PubListener::spawn(&url, tx).unwrap();
+        wait_for_connected(&mut rx).await;
+        wait_until_subscribed(&pubs, &mut rx).await;
+
+        // Restart the publisher.
+        pubs.close();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("no Disconnected event")
+            {
+                Some(NodeEvent::Disconnected) => break,
+                Some(_) => {}
+                None => panic!("listener channel closed"),
+            }
+        }
+        let pubs = publisher(&url);
+        wait_for_connected(&mut rx).await;
+        wait_until_subscribed(&pubs, &mut rx).await;
+
+        pubs.send(nng::Message::from(&mining_work_changed(7)[..]))
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(NodeEvent::MiningWorkChanged(m))) => assert_eq!(m.template_epoch, 7),
+            other => panic!("unexpected {other:?}"),
+        }
+        drop(rx);
+        listener.stop();
     }
 
     #[test]
