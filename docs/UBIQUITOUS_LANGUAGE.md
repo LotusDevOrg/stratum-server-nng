@@ -40,7 +40,7 @@ Facade that orchestrates accounting operations across multiple repositories. The
 **Related terms:**
 - **Accepted Share:** Share whose header hash meets the session's P_diff target
 - **High-Hash Share:** Share whose header hash meets P_diff but does NOT meet N_diff (the network target). Lotusd returns "high-hash" on submission. These shares are credited to the miner with `network_target_ok=false` — they contributed work to the pool even though they didn't find a block.
-- **Rejected Share:** Share that failed validation (stale-job, low-difficulty, unauthorized-worker, invalid format, ntime-mismatch)
+- **Rejected Share:** Share that failed validation (stale-job, low-difficulty, unauthorized-worker, invalid format, ntime-mismatch). An extranonce2 whose size differs from the session's announced `extranonce2_size` is an invalid format (`invalid-submit-shape`).
 - **Stale Share:** Share submitted for a job that is no longer active (miner was working on outdated template)
 - **Low-Difficulty Share:** Share whose header hash does not meet the session's P_diff target
 
