@@ -121,7 +121,7 @@ The global canonical difficulty of the Lotus blockchain, derived from the mining
 
 **Key invariant:** N_diff is the authoritative difficulty target for valid network-proof-of-work. A share whose hash meets N_diff is a valid network block candidate.
 
-**Key invariant:** All per-session pool difficulties (P_diff) are bounded by N_diff as an absolute ceiling. P_diff ∈ [vardiff_min_floor, N_diff].
+**Key invariant:** All per-session pool difficulties (P_diff) are bounded by N_diff as an absolute ceiling. P_diff ∈ [vardiff_min_floor, N_diff]; when N_diff is below vardiff_min_floor (e.g. regtest), P_diff = N_diff — the ceiling wins, so that every network block candidate is still a share.
 
 ### Pool Difficulty (P_diff)
 The per-session difficulty assigned to a miner via `mining.set_difficulty`. P_diff is:

@@ -72,7 +72,7 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 - `clean_jobs=true` clears all assigned jobs immediately
 
 ### VarDiff
-- P_diff ∈ [vardiff_min_floor, N_diff] at all times
+- P_diff ∈ [vardiff_min_floor, N_diff] at all times; if N_diff < vardiff_min_floor, P_diff = N_diff (the ceiling wins, never a panic)
 - P_diff is clamped down when N_diff decreases (via `update_max`)
 - Share difficulty = P_diff at assignment time (immutable)
 - VarDiff is per-session, not per-worker
