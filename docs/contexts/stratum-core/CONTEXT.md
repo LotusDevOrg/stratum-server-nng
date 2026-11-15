@@ -31,7 +31,7 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 ## Module Responsibilities
 
 ### `stratum_protocol`
-- TCP listener accepts miner connections
+- TCP listener accepts miner connections (bound in `main.rs` before the accept task is spawned: a bind failure aborts startup)
 - Protocol parsing (JSON-RPC, Stratum methods)
 - Session state machine (subscribe → authorize → submit)
 - Job assignment and tracking (`assigned_jobs` map per session)
